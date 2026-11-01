@@ -1475,10 +1475,48 @@ function InstagramVideoControls() {
         });
     }
 
+    // Keep small Story UI controls clickable even when their container ignores pointers.
+    // The original video-overlay fix still lets native HTML5 controls receive clicks.
+    function restoreStoryInteractiveElements(videos) {
+        const videoRects = videos.map(video => video.getBoundingClientRect()).filter(rect =>
+            rect.width >= 100 && rect.height >= 100 &&
+            rect.right > 0 && rect.left < window.innerWidth &&
+            rect.bottom > 0 && rect.top < window.innerHeight
+        );
+        if (!videoRects.length) return;
+
+        const selector = 'button, a[href], input, textarea, select, ' +
+            '[role="button"], [role="textbox"], [contenteditable="true"], svg[aria-label]';
+        for (const element of document.querySelectorAll(selector)) {
+            if (!(element instanceof HTMLElement || element instanceof SVGElement)) continue;
+            const rect = element.getBoundingClientRect();
+            if (rect.width < 8 || rect.height < 8 ||
+                rect.right <= 0 || rect.bottom <= 0 ||
+                rect.left >= window.innerWidth || rect.top >= window.innerHeight) continue;
+
+            const isTextField = element.matches(
+                'input, textarea, select, [role="textbox"], [contenteditable="true"]'
+            );
+            const nearStory = videoRects.some(videoRect => {
+                const margin = 100;
+                return rect.right > videoRect.left - margin &&
+                    rect.left < videoRect.right + margin &&
+                    rect.bottom > videoRect.top &&
+                    rect.top < videoRect.bottom + margin &&
+                    (isTextField || (rect.width < videoRect.width * 0.7 &&
+                        rect.height < videoRect.height * 0.25));
+            });
+            if (nearStory) {
+                element.style.setProperty('pointer-events', 'auto', 'important');
+            }
+        }
+    }
+
     function modifyAllPresentVideos() {
         const videos = getVideos();
         videos.forEach(modifyVideo);
         videos.forEach(fixVideoOverlays);
+        if (isInstagramStoriesPage()) restoreStoryInteractiveElements(videos);
         restoreInstagramMuteButtons();
     }
 
@@ -1534,9 +1572,7 @@ function InstagramVideoControls() {
             // But often this results in a failed download if the user clicks the button.
             videoPlayer.setAttribute('controlsList', '');
 
-            if (isInstagramStoriesPage()) {
-                incapacitateStoryVideoPausingOverlays(videoPlayer);
-            }
+            // Preserve Instagram's Story buttons and reply fields.
 
             // TWO-WAY MUTE BUTTON SYNC
             // Sync our HTML5 controls with Instagram's mute button in BOTH directions
