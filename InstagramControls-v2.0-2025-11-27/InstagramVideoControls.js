@@ -574,6 +574,59 @@ function InstagramVideoControls() {
         video.addEventListener('leavepictureinpicture', leavePiPHandler);
     }
     
+    // Keep only previously playing videos running when the tab/window loses focus.
+    // Do not start videos which the user paused while in the foreground.
+    function setupBackgroundPlayback() {
+        const playingBeforeBlur = new WeakSet();
+        const retryBudget = new WeakMap();
+        const isBackground = () => document.hidden || !document.hasFocus();
+
+        function rememberPlaying() {
+            document.querySelectorAll('video').forEach(video => {
+                if (!video.paused && !video.ended) playingBeforeBlur.add(video);
+            });
+        }
+
+        function resumeIfInterrupted(video) {
+            if (!isBackground() || !playingBeforeBlur.has(video) || !video.isConnected ||
+                !video.paused || video.ended || document.pictureInPictureElement === video) return;
+
+            // Limit repeated play() attempts if Instagram/browser refuses playback.
+            const time = Date.now();
+            const last = retryBudget.get(video);
+            const withinWindow = last && time - last.start < 10000;
+            const attempts = withinWindow ? last.count : 0;
+            if (attempts >= 3) return;
+            retryBudget.set(video, { start: withinWindow ? last.start : time, count: attempts + 1 });
+            video.play().catch(() => {});
+        }
+
+        // play/pause do not bubble, so observe them in capture phase.
+        document.addEventListener('play', event => {
+            if (event.target instanceof HTMLVideoElement) playingBeforeBlur.add(event.target);
+        }, true);
+        document.addEventListener('pause', event => {
+            const video = event.target;
+            if (!(video instanceof HTMLVideoElement)) return;
+            if (isBackground()) {
+                setTimeout(() => resumeIfInterrupted(video), 0);
+            } else {
+                playingBeforeBlur.delete(video);
+            }
+        }, true);
+
+        const onBackground = () => {
+            rememberPlaying();
+            // Instagram may pause in a separate blur/visibility handler.
+            setTimeout(() => document.querySelectorAll('video').forEach(resumeIfInterrupted), 0);
+        };
+        window.addEventListener('blur', onBackground, true);
+        document.addEventListener('visibilitychange', () => {
+            if (isBackground()) onBackground();
+        }, true);
+        rememberPlaying();
+    }
+
     // Store reference to Document PiP window
     let documentPiPWindow = null;
     
@@ -1424,8 +1477,59 @@ function InstagramVideoControls() {
         }
     }
 
-    // Liberar a barra HTML5 sem desativar os botoes de audio do Instagram.
+    // Preserve Story/Reels behavior; feed overlays must keep their click handlers.
+    const disabledVideoOverlays = new Map();
+    const clippedFeedOverlays = new Map();
+    let lastOverlayMode = null;
+
+    function restoreVideoOverlays() {
+        for (const [overlay, original] of disabledVideoOverlays) {
+            if (!overlay.isConnected) continue;
+            // Do not undo changes subsequently made by Instagram itself.
+            if (overlay.style.getPropertyValue('pointer-events') !== 'none' ||
+                overlay.style.getPropertyPriority('pointer-events') !== 'important') continue;
+            if (original.value) {
+                overlay.style.setProperty('pointer-events', original.value, original.priority);
+            } else {
+                overlay.style.removeProperty('pointer-events');
+            }
+        }
+        disabledVideoOverlays.clear();
+        for (const [overlay, original] of clippedFeedOverlays) {
+            if (!overlay.isConnected ||
+                overlay.style.getPropertyValue('clip-path') !== original.applied) continue;
+            if (original.value) {
+                overlay.style.setProperty('clip-path', original.value, original.priority);
+            } else {
+                overlay.style.removeProperty('clip-path');
+            }
+        }
+        clippedFeedOverlays.clear();
+    }
+
+    function isInstagramDialogOpen() {
+        return [...document.querySelectorAll('[role="dialog"], [aria-modal="true"]')].some(dialog => {
+            if (dialog.getAttribute('aria-hidden') === 'true') return false;
+            const rect = dialog.getBoundingClientRect();
+            const style = getComputedStyle(dialog);
+            return rect.width > 0 && rect.height > 0 &&
+                style.display !== 'none' && style.visibility !== 'hidden';
+        });
+    }
+
+    // Free HTML5 controls in the feed without disabling modal close/backdrop events.
     function fixVideoOverlays(video) {
+        const dialogOpen = isInstagramDialogOpen();
+        const dialog = video.closest('[role="dialog"], [aria-modal="true"]');
+        const mode = dialogOpen ? 'dialog' : 'page';
+        if (lastOverlayMode !== mode) {
+            restoreVideoOverlays();
+            lastOverlayMode = mode;
+        }
+        // Only modify the video inside the active dialog, not feed videos
+        // behind the modal. The dialog backdrop and close button stay intact.
+        if (dialogOpen && !dialog) return;
+
         const rect = video.getBoundingClientRect();
         if (rect.width < 80 || rect.height < 80 ||
             rect.bottom > window.innerHeight || rect.bottom < 24 ||
@@ -1433,6 +1537,18 @@ function InstagramVideoControls() {
             return;
         }
 
+        // Drop detached nodes to avoid accumulating references while scrolling.
+        for (const overlay of disabledVideoOverlays.keys()) {
+            if (!overlay.isConnected) disabledVideoOverlays.delete(overlay);
+        }
+        for (const overlay of clippedFeedOverlays.keys()) {
+            if (!overlay.isConnected) clippedFeedOverlays.delete(overlay);
+        }
+
+        const article = video.closest('article');
+        const scope = dialogOpen ? dialog : article;
+        const clipControls = Boolean(dialogOpen && dialog) ||
+            (Boolean(article) && !isInstagramStoriesPage() && !isInstagramReelsPage());
         const y = Math.round(rect.bottom - 20);
         for (const ratio of [0.15, 0.5, 0.85]) {
             const x = Math.round(rect.left + rect.width * ratio);
@@ -1444,6 +1560,64 @@ function InstagramVideoControls() {
 
             for (const overlay of elements.slice(0, videoIndex)) {
                 if (!(overlay instanceof HTMLElement) || overlay.contains(video)) continue;
+                if (scope && !scope.contains(overlay)) continue;
+                // Never clip controls outside this video/dialog (e.g. Close).
+                if (dialogOpen && overlay.closest('[role="dialog"], [aria-modal="true"]') !== dialog) continue;
+                if (!dialogOpen && overlay.closest('[role="dialog"], [aria-modal="true"]')) continue;
+
+                if (clipControls) {
+                    // Only full-video overlays are candidates. Never touch the
+                    // dialog backdrop, close button or small interactive items.
+                    const r = overlay.getBoundingClientRect();
+                    if (r.width < rect.width * 0.65 || r.width > rect.width * 1.25 ||
+                        r.height < rect.height * 0.55 || r.height > rect.height * 1.25 ||
+                        r.left > rect.left + rect.width * 0.15 ||
+                        r.right < rect.right - rect.width * 0.15 ||
+                        r.top > rect.top + rect.height * 0.25 ||
+                        Math.abs(r.bottom - rect.bottom) > rect.height * 0.15) continue;
+
+                    if (dialogOpen && dialog) {
+                        // DM previews should behave like standalone videos: the
+                        // video itself receives native mouse/seek interactions.
+                        // This is limited to full-size blockers *inside* this
+                        // dialog and never affects the outside-to-close region.
+                        if (!disabledVideoOverlays.has(overlay)) {
+                            disabledVideoOverlays.set(overlay, {
+                                value: overlay.style.getPropertyValue('pointer-events'),
+                                priority: overlay.style.getPropertyPriority('pointer-events')
+                            });
+                        }
+                        overlay.style.setProperty('pointer-events', 'none', 'important');
+                        continue;
+                    }
+                    // On the feed, retain Instagram's click-to-open overlay
+                    // above the video, but expose its native bottom controls.
+                    const bottom = Math.round(r.bottom - (rect.bottom - 56));
+                    if (bottom < 20 || bottom >= r.height * 0.4) continue;
+                    if (!clippedFeedOverlays.has(overlay)) {
+                        // Do not replace existing clipping/visual effects.
+                        if (getComputedStyle(overlay).clipPath !== 'none') continue;
+                        clippedFeedOverlays.set(overlay, {
+                            value: overlay.style.getPropertyValue('clip-path'),
+                            priority: overlay.style.getPropertyPriority('clip-path'),
+                            applied: ''
+                        });
+                    }
+                    // Free the bottom controls without hiding the rest of the
+                    // video overlay. The audio hitbox mirrors clipped icons.
+                    const applied = `inset(0px 0px ${bottom}px 0px)`;
+                    overlay.style.setProperty('clip-path', applied, 'important');
+                    clippedFeedOverlays.get(overlay).applied = overlay.style.getPropertyValue('clip-path');
+                    continue;
+                }
+
+                // Preserve v3 behavior on Stories and standalone Reels.
+                if (!disabledVideoOverlays.has(overlay)) {
+                    disabledVideoOverlays.set(overlay, {
+                        value: overlay.style.getPropertyValue('pointer-events'),
+                        priority: overlay.style.getPropertyPriority('pointer-events')
+                    });
+                }
                 overlay.style.setProperty('pointer-events', 'none', 'important');
             }
         }
@@ -2578,6 +2752,7 @@ function InstagramVideoControls() {
                 log(`Initialized lastKnownPlaybackRate from storage: ${lastKnownPlaybackRate}`);
             }
             
+            setupBackgroundPlayback();
             attachPageVisibilityListener();
             startVideoModificationPhase();
             // Reduced from 200ms to 1000ms - MutationObserver handles most cases, this is just a fallback

@@ -9,6 +9,13 @@
     "minimum_chrome_version":  "88",
     "content_scripts":  [
                             {
+                                "matches": ["https://*.instagram.com/*"],
+                                "all_frames": true,
+                                "run_at": "document_start",
+                                "world": "MAIN",
+                                "js": ["ic-background-playback-main.js"]
+                            },
+                            {
                                 "matches":  [
                                                 "https://*.instagram.com/*"
                                             ],
